@@ -6,7 +6,7 @@
 
 // WiFi热点参数
 const char* ssid = "ESP32-WebControl";
-const char* password = "12345678";
+const char* password = "";
 
 // BLE键盘
 BleKeyboard bleKeyboard;
@@ -22,6 +22,8 @@ unsigned long photoInterval = 10000; // 默认10秒
 // GPIO8 LED
 const int ledPin = 8;
 bool isLedOn = false;
+unsigned long lastLedToggleTime = 0;
+unsigned long ledInterval = 1000; // 正常状态下的闪烁间隔（毫秒）
 
 // WiFi设置
 String savedWifiName = "";
@@ -38,6 +40,7 @@ Preferences preferences;
 
 // 连接WiFi热点
 void setupWiFi() {
+  WiFi.setSleep(ESP_LIGHT_SLEEP); // 启用WiFi低功耗模式
   WiFi.softAP(ssid, password);
   Serial.println("WiFi热点已创建");
   Serial.print("IP地址: ");
@@ -48,12 +51,223 @@ void setupWiFi() {
 void setupLed() {
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, HIGH); // 初始化为关闭状态 (0为亮，1为灭)
+  lastLedToggleTime = millis();
+}
+
+// 非阻塞LED闪烁逻辑
+void updateLed() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastLedToggleTime >= ledInterval) {
+    lastLedToggleTime = currentTime;
+    isLedOn = !isLedOn;
+    digitalWrite(ledPin, isLedOn ? HIGH : LOW); // 更新LED状态
+  }
+}
+
+// 初始化Web服务器路由
+void setupServer() {
+  server.on("/", handleRoot);
+  server.on("/take_photo", handleTakePhoto);
+  server.on("/start_continuous", handleStartContinuous);
+  server.on("/stop_continuous", handleStopContinuous);
+  server.on("/save_wifi", handleSaveWifi);
+  server.on("/save_bluetooth", handleSaveBleName);
+  server.on("/get_settings", handleGetSettings);
+  server.on("/heartbeat", handleHeartbeat);
+  server.on("/bluetooth_status", handleBluetoothStatus);
+  server.begin();
+  Serial.println("Web服务器已启动");
+}
+
+// 拍照处理
+void handleTakePhoto() {
+  if (bleKeyboard.isConnected()) {
+    sendKeyPress(selectedKey);
+    server.send(200, "text/plain", "拍照成功");
+  } else {
+    server.send(500, "text/plain", "设备未连接");
+  }
+}
+
+// 开始连拍
+void handleStartContinuous() {
+  if (server.method() == HTTP_POST && server.hasArg("plain")) {
+    String json = server.arg("plain");
+    int startIndex = json.indexOf('{');
+    int endIndex = json.lastIndexOf('}') + 1;
+    if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
+      json = json.substring(startIndex, endIndex);
+      DynamicJsonDocument doc(1024);
+      DeserializationError error = deserializeJson(doc, json);
+      if (!error) {
+        int interval = doc["interval"].as<int>();
+        if (interval > 0) {
+          photoInterval = interval * 1000; // 转换为毫秒
+          isContinuousShooting = true;
+          lastPhotoTime = millis();
+          server.send(200, "text/plain", "开始连拍");
+        } else {
+          server.send(400, "text/plain", "无效的间隔值");
+        }
+      } else {
+        server.send(500, "text/plain", "错误：无法解析JSON");
+      }
+    } else {
+      server.send(400, "text/plain", "错误：无效的JSON格式");
+    }
+  } else {
+    server.send(405, "text/plain", "错误：方法不支持");
+  }
+}
+
+// 停止连拍
+void handleStopContinuous() {
+  isContinuousShooting = false;
+  server.send(200, "text/plain", "停止连拍");
+}
+
+// 保存WiFi设置
+void handleSaveWifi() {
+  if (server.method() == HTTP_POST && server.hasArg("plain")) {
+    String json = server.arg("plain");
+    int startIndex = json.indexOf('{');
+    int endIndex = json.lastIndexOf('}') + 1;
+    if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
+      json = json.substring(startIndex, endIndex);
+      DynamicJsonDocument doc(1024);
+      DeserializationError error = deserializeJson(doc, json);
+      if (!error) {
+        savedWifiName = doc["name"].as<String>();
+        savedWifiPassword = doc["password"].as<String>();
+        preferences.putString("wifiName", savedWifiName);
+        preferences.putString("wifiPassword", savedWifiPassword);
+        server.send(200, "text/plain", "WiFi设置已保存");
+      } else {
+        server.send(500, "text/plain", "错误：无法解析JSON");
+      }
+    } else {
+      server.send(400, "text/plain", "错误：无效的JSON格式");
+    }
+  } else {
+    server.send(405, "text/plain", "错误：方法不支持");
+  }
+}
+
+// 保存蓝牙设置
+void handleSaveBleName() {
+  if (server.method() == HTTP_POST && server.hasArg("plain")) {
+    String json = server.arg("plain");
+    int startIndex = json.indexOf('{');
+    int endIndex = json.lastIndexOf('}') + 1;
+    if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
+      json = json.substring(startIndex, endIndex);
+      DynamicJsonDocument doc(1024);
+      DeserializationError error = deserializeJson(doc, json);
+      if (!error) {
+        savedBleName = doc["name"].as<String>();
+        selectedKey = doc["key"].as<String>();
+        bleKeyboard.setName(savedBleName.c_str());
+        preferences.putString("bleName", savedBleName);
+        preferences.putString("selectedKey", selectedKey);
+        server.send(200, "text/plain", "蓝牙设置已保存");
+      } else {
+        server.send(500, "text/plain", "错误：无法解析JSON");
+      }
+    } else {
+      server.send(400, "text/plain", "错误：无效的JSON格式");
+    }
+  } else {
+    server.send(405, "text/plain", "错误：方法不支持");
+  }
+}
+
+// 获取保存的设置
+void handleGetSettings() {
+  DynamicJsonDocument doc(1024);
+  doc["wifiName"] = preferences.getString("wifiName", "");
+  doc["wifiPassword"] = preferences.getString("wifiPassword", "");
+  doc["bluetoothName"] = preferences.getString("bleName", "ESP32-C3");
+  doc["selectedKey"] = preferences.getString("selectedKey", "KEY_MEDIA_VOLUME_UP");
+
+  String json;
+  serializeJson(doc, json);
+  server.send(200, "application/json", json);
+}
+
+// 心跳检测
+void handleHeartbeat() {
+  server.send(200, "text/plain", "alive");
+}
+
+// 蓝牙连接状态
+void handleBluetoothStatus() {
+  String status = bleKeyboard.isConnected() ? "connected" : "disconnected";
+  server.send(200, "text/plain", status);
+}
+
+// 发送按键
+void sendKeyPress(String key) {
+  if (key == "KEY_MEDIA_VOLUME_UP") {
+    bleKeyboard.write(KEY_MEDIA_VOLUME_UP);
+  } else if (key == "KEY_MEDIA_VOLUME_DOWN") {
+    bleKeyboard.write(KEY_MEDIA_VOLUME_DOWN);
+  } else if (key == "KEY_ESC") {
+    bleKeyboard.write(KEY_ESC);
+  } else if (key == "KEY_UP_ARROW") {
+    bleKeyboard.write(KEY_UP_ARROW);
+  } else if (key == "KEY_DOWN_ARROW") {
+    bleKeyboard.write(KEY_DOWN_ARROW);
+  } else if (key == "KEY_LEFT_ARROW") {
+    bleKeyboard.write(KEY_LEFT_ARROW);
+  } else if (key == "KEY_RIGHT_ARROW") {
+    bleKeyboard.write(KEY_RIGHT_ARROW);
+  } else if (key == "KEY_PAGE_UP") {
+    bleKeyboard.write(KEY_PAGE_UP);
+  } else if (key == "KEY_PAGE_DOWN") {
+    bleKeyboard.write(KEY_PAGE_DOWN);
+  } else if (key == "KEY_TAB") {
+    bleKeyboard.write(KEY_TAB);
+  } else if (key == "KEY_SHIFT") {
+    bleKeyboard.write(KEY_LEFT_SHIFT);
+  } else if (key == "KEY_CONTROL") {
+    bleKeyboard.write(KEY_LEFT_CTRL);
+  } else if (key == "KEY_ALT") {
+    bleKeyboard.write(KEY_LEFT_ALT);
+  } else if (key == "KEY_F1") {
+    bleKeyboard.write(KEY_F1);
+  } else if (key == "KEY_F2") {
+    bleKeyboard.write(KEY_F2);
+  } else if (key == "KEY_F3") {
+    bleKeyboard.write(KEY_F3);
+  } else if (key == "KEY_F4") {
+    bleKeyboard.write(KEY_F4);
+  } else if (key == "KEY_F5") {
+    bleKeyboard.write(KEY_F5);
+  } else if (key == "KEY_F6") {
+    bleKeyboard.write(KEY_F6);
+  } else if (key == "KEY_F7") {
+    bleKeyboard.write(KEY_F7);
+  } else if (key == "KEY_F8") {
+    bleKeyboard.write(KEY_F8);
+  } else if (key == "KEY_F9") {
+    bleKeyboard.write(KEY_F9);
+  } else if (key == "KEY_F10") {
+    bleKeyboard.write(KEY_F10);
+  } else if (key == "KEY_F11") {
+    bleKeyboard.write(KEY_F11);
+  } else if (key == "KEY_F12") {
+    bleKeyboard.write(KEY_F12);
+  } else {
+    bleKeyboard.write(KEY_MEDIA_VOLUME_UP); // 默认使用音量+
+  }
 }
 
 // 处理根路径请求
 void handleRoot() {
   server.send(200, "text/html", getWebPage());
 }
+
+// 获取网页内容
 
 // 获取网页内容
 String getWebPage() {
@@ -671,207 +885,6 @@ String getWebPage() {
   return html;
 }
 
-// 拍照处理
-void handleTakePhoto() {
-  if (bleKeyboard.isConnected()) {
-    if (selectedKey == "KEY_MEDIA_VOLUME_UP") {
-      bleKeyboard.write(KEY_MEDIA_VOLUME_UP);
-    } else if (selectedKey == "KEY_MEDIA_VOLUME_DOWN") {
-      bleKeyboard.write(KEY_MEDIA_VOLUME_DOWN);
-    } else if (selectedKey == "KEY_ESC") {
-      bleKeyboard.write(KEY_ESC);
-    } else if (selectedKey == "KEY_UP_ARROW") {
-      bleKeyboard.write(KEY_UP_ARROW);
-    } else if (selectedKey == "KEY_DOWN_ARROW") {
-      bleKeyboard.write(KEY_DOWN_ARROW);
-    } else if (selectedKey == "KEY_LEFT_ARROW") {
-      bleKeyboard.write(KEY_LEFT_ARROW);
-    } else if (selectedKey == "KEY_RIGHT_ARROW") {
-      bleKeyboard.write(KEY_RIGHT_ARROW);
-    } else if (selectedKey == "KEY_PAGE_UP") {
-      bleKeyboard.write(KEY_PAGE_UP);
-    } else if (selectedKey == "KEY_PAGE_DOWN") {
-      bleKeyboard.write(KEY_PAGE_DOWN);
-    } else if (selectedKey == "KEY_TAB") {
-      bleKeyboard.write(KEY_TAB);
-    } else if (selectedKey == "KEY_SHIFT") {
-      bleKeyboard.write(KEY_LEFT_SHIFT);
-    } else if (selectedKey == "KEY_CONTROL") {
-      bleKeyboard.write(KEY_LEFT_CTRL);
-    } else if (selectedKey == "KEY_ALT") {
-      bleKeyboard.write(KEY_LEFT_ALT);
-    } else if (selectedKey == "KEY_F1") {
-      bleKeyboard.write(KEY_F1);
-    } else if (selectedKey == "KEY_F2") {
-      bleKeyboard.write(KEY_F2);
-    } else if (selectedKey == "KEY_F3") {
-      bleKeyboard.write(KEY_F3);
-    } else if (selectedKey == "KEY_F4") {
-      bleKeyboard.write(KEY_F4);
-    } else if (selectedKey == "KEY_F5") {
-      bleKeyboard.write(KEY_F5);
-    } else if (selectedKey == "KEY_F6") {
-      bleKeyboard.write(KEY_F6);
-    } else if (selectedKey == "KEY_F7") {
-      bleKeyboard.write(KEY_F7);
-    } else if (selectedKey == "KEY_F8") {
-      bleKeyboard.write(KEY_F8);
-    } else if (selectedKey == "KEY_F9") {
-      bleKeyboard.write(KEY_F9);
-    } else if (selectedKey == "KEY_F10") {
-      bleKeyboard.write(KEY_F10);
-    } else if (selectedKey == "KEY_F11") {
-      bleKeyboard.write(KEY_F11);
-    } else if (selectedKey == "KEY_F12") {
-      bleKeyboard.write(KEY_F12);
-    } else {
-      bleKeyboard.write(KEY_MEDIA_VOLUME_UP); // 默认使用音量+
-    }
-    flashLed(); // 闪烁LED
-    server.send(200, "text/plain", "拍照成功");
-  } else {
-    server.send(500, "text/plain", "设备未连接");
-  }
-}
-
-// 开始连拍
-void handleStartContinuous() {
-  if (server.method() == HTTP_POST && server.hasArg("plain")) {
-    String json = server.arg("plain");
-    int startIndex = json.indexOf('{');
-    int endIndex = json.lastIndexOf('}') + 1;
-    if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
-      json = json.substring(startIndex, endIndex);
-      DynamicJsonDocument doc(1024);
-      DeserializationError error = deserializeJson(doc, json);
-      if (!error) {
-        int interval = doc["interval"].as<int>();
-        if (interval > 0) {
-          photoInterval = interval * 1000; // 转换为毫秒
-          isContinuousShooting = true;
-          lastPhotoTime = millis();
-          server.send(200, "text/plain", "开始连拍");
-        } else {
-          server.send(400, "text/plain", "无效的间隔值");
-        }
-      } else {
-        server.send(500, "text/plain", "错误：无法解析JSON");
-      }
-    } else {
-      server.send(400, "text/plain", "错误：无效的JSON格式");
-    }
-  } else {
-    server.send(405, "text/plain", "错误：方法不支持");
-  }
-}
-
-// 停止连拍
-void handleStopContinuous() {
-  isContinuousShooting = false;
-  server.send(200, "text/plain", "停止连拍");
-}
-
-// 保存WiFi设置
-void handleSaveWifi() {
-  if (server.method() == HTTP_POST && server.hasArg("plain")) {
-    String json = server.arg("plain");
-    int startIndex = json.indexOf('{');
-    int endIndex = json.lastIndexOf('}') + 1;
-    if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
-      json = json.substring(startIndex, endIndex);
-      DynamicJsonDocument doc(1024);
-      DeserializationError error = deserializeJson(doc, json);
-      if (!error) {
-        savedWifiName = doc["name"].as<String>();
-        savedWifiPassword = doc["password"].as<String>();
-        preferences.putString("wifiName", savedWifiName);
-        preferences.putString("wifiPassword", savedWifiPassword);
-        server.send(200, "text/plain", "WiFi设置已保存");
-      } else {
-        server.send(500, "text/plain", "错误：无法解析JSON");
-      }
-    } else {
-      server.send(400, "text/plain", "错误：无效的JSON格式");
-    }
-  } else {
-    server.send(405, "text/plain", "错误：方法不支持");
-  }
-}
-
-// 保存蓝牙设置
-void handleSaveBleName() {
-  if (server.method() == HTTP_POST && server.hasArg("plain")) {
-    String json = server.arg("plain");
-    int startIndex = json.indexOf('{');
-    int endIndex = json.lastIndexOf('}') + 1;
-    if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
-      json = json.substring(startIndex, endIndex);
-      DynamicJsonDocument doc(1024);
-      DeserializationError error = deserializeJson(doc, json);
-      if (!error) {
-        savedBleName = doc["name"].as<String>();
-        selectedKey = doc["key"].as<String>();
-        bleKeyboard.setName(savedBleName.c_str());
-        preferences.putString("bleName", savedBleName);
-        preferences.putString("selectedKey", selectedKey);
-        server.send(200, "text/plain", "蓝牙设置已保存");
-      } else {
-        server.send(500, "text/plain", "错误：无法解析JSON");
-      }
-    } else {
-      server.send(400, "text/plain", "错误：无效的JSON格式");
-    }
-  } else {
-    server.send(405, "text/plain", "错误：方法不支持");
-  }
-}
-
-// 获取保存的设置
-void handleGetSettings() {
-  DynamicJsonDocument doc(1024);
-  doc["wifiName"] = preferences.getString("wifiName", "");
-  doc["wifiPassword"] = preferences.getString("wifiPassword", "");
-  doc["bluetoothName"] = preferences.getString("bleName", "ESP32-C3");
-  doc["selectedKey"] = preferences.getString("selectedKey", "KEY_MEDIA_VOLUME_UP");
-
-  String json;
-  serializeJson(doc, json);
-  server.send(200, "application/json", json);
-}
-
-// 心跳检测
-void handleHeartbeat() {
-  server.send(200, "text/plain", "alive");
-}
-
-// 蓝牙连接状态
-void handleBluetoothStatus() {
-  String status = bleKeyboard.isConnected() ? "connected" : "disconnected";
-  server.send(200, "text/plain", status);
-}
-
-// 闪烁LED
-void flashLed() {
-  digitalWrite(ledPin, LOW); // 亮
-  delay(1000);
-  digitalWrite(ledPin, HIGH); // 灭
-}
-
-// 初始化Web服务器路由
-void setupServer() {
-  server.on("/", handleRoot);
-  server.on("/take_photo", handleTakePhoto);
-  server.on("/start_continuous", handleStartContinuous);
-  server.on("/stop_continuous", handleStopContinuous);
-  server.on("/save_wifi", handleSaveWifi);
-  server.on("/save_bluetooth", handleSaveBleName);
-  server.on("/get_settings", handleGetSettings);
-  server.on("/heartbeat", handleHeartbeat);
-  server.on("/bluetooth_status", handleBluetoothStatus);
-  server.begin();
-  Serial.println("Web服务器已启动");
-}
-
 void setup() {
   Serial.begin(115200);
   preferences.begin("settings", false);
@@ -894,65 +907,20 @@ void loadSettings() {
 void loop() {
   server.handleClient();
   
+  // 更新LED状态
+  updateLed();
+  
   // 连拍逻辑
   if (isContinuousShooting && bleKeyboard.isConnected()) {
     unsigned long currentTime = millis();
     if (currentTime - lastPhotoTime >= photoInterval) {
-      if (selectedKey == "KEY_MEDIA_VOLUME_UP") {
-        bleKeyboard.write(KEY_MEDIA_VOLUME_UP);
-      } else if (selectedKey == "KEY_MEDIA_VOLUME_DOWN") {
-        bleKeyboard.write(KEY_MEDIA_VOLUME_DOWN);
-      } else if (selectedKey == "KEY_ESC") {
-        bleKeyboard.write(KEY_ESC);
-      } else if (selectedKey == "KEY_UP_ARROW") {
-        bleKeyboard.write(KEY_UP_ARROW);
-      } else if (selectedKey == "KEY_DOWN_ARROW") {
-        bleKeyboard.write(KEY_DOWN_ARROW);
-      } else if (selectedKey == "KEY_LEFT_ARROW") {
-        bleKeyboard.write(KEY_LEFT_ARROW);
-      } else if (selectedKey == "KEY_RIGHT_ARROW") {
-        bleKeyboard.write(KEY_RIGHT_ARROW);
-      } else if (selectedKey == "KEY_PAGE_UP") {
-        bleKeyboard.write(KEY_PAGE_UP);
-      } else if (selectedKey == "KEY_PAGE_DOWN") {
-        bleKeyboard.write(KEY_PAGE_DOWN);
-      } else if (selectedKey == "KEY_TAB") {
-        bleKeyboard.write(KEY_TAB);
-      } else if (selectedKey == "KEY_SHIFT") {
-        bleKeyboard.write(KEY_LEFT_SHIFT);
-      } else if (selectedKey == "KEY_CONTROL") {
-        bleKeyboard.write(KEY_LEFT_CTRL);
-      } else if (selectedKey == "KEY_ALT") {
-        bleKeyboard.write(KEY_LEFT_ALT);
-      } else if (selectedKey == "KEY_F1") {
-        bleKeyboard.write(KEY_F1);
-      } else if (selectedKey == "KEY_F2") {
-        bleKeyboard.write(KEY_F2);
-      } else if (selectedKey == "KEY_F3") {
-        bleKeyboard.write(KEY_F3);
-      } else if (selectedKey == "KEY_F4") {
-        bleKeyboard.write(KEY_F4);
-      } else if (selectedKey == "KEY_F5") {
-        bleKeyboard.write(KEY_F5);
-      } else if (selectedKey == "KEY_F6") {
-        bleKeyboard.write(KEY_F6);
-      } else if (selectedKey == "KEY_F7") {
-        bleKeyboard.write(KEY_F7);
-      } else if (selectedKey == "KEY_F8") {
-        bleKeyboard.write(KEY_F8);
-      } else if (selectedKey == "KEY_F9") {
-        bleKeyboard.write(KEY_F9);
-      } else if (selectedKey == "KEY_F10") {
-        bleKeyboard.write(KEY_F10);
-      } else if (selectedKey == "KEY_F11") {
-        bleKeyboard.write(KEY_F11);
-      } else if (selectedKey == "KEY_F12") {
-        bleKeyboard.write(KEY_F12);
-      } else {
-        bleKeyboard.write(KEY_MEDIA_VOLUME_UP); // 默认使用音量+
-      }
-      flashLed(); // 闪烁LED
+      sendKeyPress(selectedKey);
       lastPhotoTime = currentTime;
+      // 连拍时调整LED闪烁间隔
+      ledInterval = 500; // 0.5秒闪烁一次
     }
+  } else {
+    // 非连拍时恢复默认闪烁间隔
+    ledInterval = 1000; // 1秒闪烁一次
   }
 }
